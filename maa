@@ -1,0 +1,265 @@
+from ugot import ugot
+import cv2
+import numpy as np
+import time
+import math
+from ultralytics import YOLO
+
+class RobotController:
+    def __init__(self, ip):
+        print("Initialisation du système... Toutenun YOLO Obstacles & Humains  test_mov.py:10 - test_mov final marche.py:10")
+        self.got = ugot.UGOT()
+        self.got.initialize(ip)
+        self.got.open_camera()
+        self.got.balance_start_balancing()
+        
+        # Modèle YOLOv8 (détecte les humains ET 79 autres types d'objets)
+        self.model = YOLO('yolov8n.pt') 
+        
+        self.speed = 14
+        self.robot_angle = 90.0
+        self.pos_x, self.pos_y = 300, 300
+        self.map_canvas = np.zeros((600, 600, 3), dtype=np.uint8)
+        
+        # --- CONFIGURATION DES SEUILS DE DISTANCE (CM) ---
+        self.seuil_humain = 22.0      # Maintenu à 22 cm (Parfait pour la sécurité)
+        self.seuil_obstacle = 15.0    # DIMINUÉ À 15 cm (Le robot s'approche plus près des objets)
+        
+        # --- CONFIGURATION DE L'HOMOGRAPHIE (PIXELS -> CM) ---
+        PTS_PIXELS = np.array([
+            [200, 240],  # 1. Coin Haut-Gauche (pixel)
+            [440, 240],  # 2. Coin Haut-Droite (pixel)
+            [560, 440],  # 3. Coin Bas-Droite (pixel)
+            [80,  440]   # 4. Coin Bas-Gauche (pixel)
+        ], dtype=np.float32)
+
+        PTS_REELS_CM = np.array([
+            [-15.0, 40.0], # X = -15cm, Y = 40cm
+            [15.0,  40.0], # X = 15cm,  Y = 40cm
+            [15.0,  15.0], # X = 15cm,  Y = 15cm
+            [-15.0, 15.0]  # X = -15cm, Y = 15cm
+        ], dtype=np.float32)
+
+        self.H, _ = cv2.findHomography(PTS_PIXELS, PTS_REELS_CM)
+
+        # --- CONFIGURATION DU FILTRE DE LUMIÈRE (CLAHE) ---
+        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        
+        # États mémoire pour stabiliser l'affichage alterné
+        self.frame_count = 0
+        self.last_human_state = np.zeros((3,), dtype=bool)
+        self.last_obstacle_state = np.zeros((3,), dtype=bool)
+        self.last_deviation_state = False
+        
+        time.sleep(2.0)
+        
+    def pix_to_cm(self, x, y):
+        """Convertit les coordonnées de pixels (x, y) en coordonnées réelles (X_cm, Y_cm)."""
+        point = np.array([[[x, y]]], dtype=np.float32)
+        point_cm = cv2.perspectiveTransform(point, self.H)
+        return point_cm[0][0][0], point_cm[0][0][1]
+
+    def update_map(self):
+        """Dessine la trajectoire sur la carte 2D."""
+        rad = math.radians(self.robot_angle)
+        self.pos_x += self.speed * 0.05 * math.cos(rad) * 2
+        self.pos_y -= self.speed * 0.05 * math.sin(rad) * 2
+        cv2.circle(self.map_canvas, (int(self.pos_x), int(self.pos_y)), 2, (0, 255, 255), -1)
+        cv2.imshow("Mini-Carte 2D", self.map_canvas)
+
+    def process_detection_matrix(self, frame):
+        """
+        Analyse l'environnement via YOLO. Calcule la distance de TOUT ce qui bouge 
+        ou bloque la route et met à jour la matrice HUD selon les seuils configurés.
+        """
+        h, w = frame.shape[:2]
+        w3 = w // 3
+        self.frame_count += 1
+        
+        matrix = np.zeros((2, 3), dtype=bool)
+        deviation_necessaire = False
+        
+        # Traitement d'image de base
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_stable = self.clahe.apply(gray)
+        
+        # --- ANALYSE IA (Toutes les 2 images pour préserver les FPS) ---
+        if self.frame_count % 2 == 0:
+            human_in_danger_zone = np.zeros((3,), dtype=bool)
+            obstacle_in_danger_zone = np.zeros((3,), dtype=bool)
+            
+            # APPEL YOLO SANS FILTRE DE CLASSE
+            results = self.model(frame, verbose=False)
+            
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                cls = int(box.cls[0].cpu().numpy()) 
+                obj_name = self.model.names[cls]    
+                
+                cx = (x1 + x2) / 2
+                x_cm, y_cm = self.pix_to_cm(cx, y2) 
+                
+                # Zone latérale de collision (largeur robot : entre -15cm et +15cm)
+                dans_le_couloir = (-15.0 <= x_cm <= 15.0)
+                
+                # Détermination de la colonne (Gauche, Centre, Droite)
+                col = 0 if x_cm < -5.0 else (1 if x_cm < 5.0 else 2)
+                
+                # --- CAS 1 : L'OBJET EST UN HUMAIN (Classe 0) ---
+                if cls == 0:
+                    if y_cm > self.seuil_humain:
+                        # Mode Suivi (Loin) -> Cadre Orange
+                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 120, 0), 2)
+                        cv2.putText(frame, f"Humain: {y_cm:.1f} cm", (int(x1), int(y1) - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 120, 0), 2)
+                    elif y_cm <= self.seuil_humain and dans_le_couloir:
+                        # Mode Danger (Proche) -> Cadre Rouge + Alerte
+                        deviation_necessaire = True
+                        human_in_danger_zone[col] = True
+                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+                        cv2.putText(frame, f"STOP HUMAIN: {y_cm:.1f} cm", (int(x1), int(y1) - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                
+                # --- CAS 2 : L'OBJET EST UN OBSTACLE GÉNÉRIQUE (Autre classe YOLO) ---
+                else:
+                    if y_cm > self.seuil_obstacle:
+                        # Mode Suivi Obstacle (Loin) -> Cadre Magenta/Rose
+                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255), 2)
+                        cv2.putText(frame, f"{obj_name}: {y_cm:.1f} cm", (int(x1), int(y1) - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+                    elif y_cm <= self.seuil_obstacle and dans_le_couloir:
+                        # Mode Danger Obstacle (Ultra-proche) -> Cadre Rouge Épais + Alerte
+                        deviation_necessaire = True
+                        obstacle_in_danger_zone[col] = True
+                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+                        cv2.putText(frame, f"STOP {obj_name.upper()}: {y_cm:.1f} cm", (int(x1), int(y1) - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                                
+            # Sauvegarde des états pour l'image suivante (Évite le clignotement à l'écran)
+            self.last_human_state = human_in_danger_zone
+            self.last_obstacle_state = obstacle_in_danger_zone
+            self.last_deviation_state = deviation_necessaire
+        else:
+            deviation_necessaire = self.last_deviation_state
+        
+        # Remplissage final de la matrice HUD
+        matrix[0, :] = self.last_human_state
+        matrix[1, :] = self.last_obstacle_state
+        
+        # --- RENDU VISUEL DE LA MATRICE (HUD) ---
+        start_x, start_y = 15, 15
+        cell_w, cell_h = 75, 30
+        for r in range(2):
+            for c in range(3):
+                x_cell = start_x + c * cell_w
+                y_cell = start_y + r * cell_h
+                color = (100, 100, 100) 
+                label = f"H:{['G','C','D'][c]}" if r == 0 else f"O:{['G','C','D'][c]}"
+                
+                if r == 0 and matrix[r, c]: color = (0, 255, 0)  # Vert si Humain < 22cm
+                if r == 1 and matrix[r, c]: color = (0, 0, 255)  # Rouge si Obstacle < 15cm
+                
+                cv2.rectangle(frame, (x_cell, y_cell), (x_cell + cell_w, y_cell + cell_h), color, -1)
+                cv2.rectangle(frame, (x_cell, y_cell), (x_cell + cell_w, y_cell + cell_h), (255, 255, 255), 1)
+                cv2.putText(frame, label, (x_cell + 12, y_cell + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        # Lignes verticales des 3 couloirs de vision
+        cv2.line(frame, (w3, 0), (w3, h), (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.line(frame, (2 * w3, 0), (2 * w3, h), (200, 200, 200), 1, cv2.LINE_AA)
+        
+        # --- LIGNES DE DANGER VIRTUELLES ---
+        # Ligne Orange pour le seuil Humain (22 cm)
+        cv2.line(frame, (0, int(h * 0.55)), (w, int(h * 0.55)), (0, 120, 255), 1, cv2.LINE_AA)
+        # Ligne Rouge plus basse pour le seuil Obstacle (15 cm)
+        cv2.line(frame, (0, int(h * 0.72)), (w, int(h * 0.72)), (0, 0, 255), 1, cv2.LINE_AA)
+        
+        # Effets sonores/lumineux si un humain bloque de près
+        if deviation_necessaire and np.any(matrix[0, :]):
+            self.got.show_light_rgb_effect(255, 0, 0, 3)
+            self.got.play_sound("lion")
+            
+        return deviation_necessaire
+
+    def naviguer_segment(self, distance, angle_cible):
+        """Fait avancer le robot en ligne droite et gère l'évitement intelligent en boîte."""
+        duree = distance / self.speed
+        start = time.time()
+        
+        while time.time() - start < duree:
+            data = self.got.read_camera_data()
+            if data:
+                frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                deviation_declenchee = self.process_detection_matrix(frame)
+                
+                if deviation_declenchee:
+                    print("🛑 Périmètre critique violé ! Déviation d'évitement activée.  test_mov.py:195 - test_mov final marche.py:195")
+                    self.got.balance_move_speed(0, 0)
+                    time.sleep(0.1)
+                    
+                    # --- SÉQUENCE D'ÉVITEMENT GÉOMÉTRIQUE STRICTE ---
+                    # 1. Échappement à DROITE (Intérieur du parcours carré)
+                    self.got.balance_turn_speed(3, 40) 
+                    time.sleep(0.4)
+                    self.got.balance_move_speed(0, self.speed) 
+                    time.sleep(0.4)
+                    
+                    # 2. Rétablissement (Parallèle à la ligne de course)
+                    self.got.balance_turn_speed(2, 40) 
+                    time.sleep(0.4)
+                    self.got.balance_move_speed(0, self.speed) 
+                    time.sleep(0.8)
+                    
+                    # 3. Retour vers la trajectoire originale
+                    self.got.balance_turn_speed(2, 40) 
+                    time.sleep(0.4)
+                    self.got.balance_move_speed(0, self.speed) 
+                    time.sleep(0.4)
+                    
+                    # 4. Réalignement final dans l'axe
+                    self.got.balance_turn_speed(3, 40) 
+                    time.sleep(0.4)
+                    
+                    # Recalibrage immédiat via la fonction Boussole/IMU
+                    self.tourner_recaler(angle_cible)
+                    
+                    # Nettoyage du flux d'images en retard
+                    for _ in range(8):
+                        self.got.read_camera_data()
+                    
+                    self.got.balance_move_speed(0, self.speed)
+                
+                self.got.balance_move_speed(0, self.speed)
+                self.update_map()
+                cv2.imshow("Vision Robot", frame)
+                
+            if cv2.waitKey(1) == ord('q'): break
+        self.got.balance_move_speed(0, 0)
+
+    def tourner_recaler(self, angle_cible):
+        """Permet d'effectuer une rotation angulaire propre."""
+        diff = (angle_cible - self.robot_angle)
+        direction = 3 if diff < 0 else 2
+        self.got.balance_turn_speed(direction, 90)
+        time.sleep(abs(diff) / 90)
+        self.got.balance_turn_speed(direction, 0)
+        self.robot_angle = float(angle_cible)
+        time.sleep(0.2)
+
+    def run_mission(self):
+        try:
+            cv2.rectangle(self.map_canvas, (120, 120), (480, 480), (255, 0, 0), 1)
+            segments = [(180, 0), (120, -90), (180, -180), (120, -270)]
+            
+            for dist, angle in segments:
+                self.naviguer_segment(dist, angle)
+                self.tourner_recaler(angle)
+                
+            print("🏁 Mission accomplie ! Le robot est revenu à sa position initiale.  test_mov.py:257 - test_mov final marche.py:257")
+            self.got.play_sound("victory")
+        finally:
+            self.got.balance_stop_balancing()
+            cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    robot = RobotController("172.16.0.68")
+    robot.run_mission()
